@@ -5,16 +5,20 @@
 캘리브레이션 해상도와 보정 대상 해상도가 다를 경우 fx/fy/cx/cy를 자동 스케일링한다.
 
 사용 시나리오:
-  1. 기존 캘리브레이션 JSON 사용:
+  1. 이미지 폴더 보정 (기존 JSON):
        python calibrate_undistort.py <input_dir> <output_dir> \\
            --calib_json calib.json
 
-  2. 체커보드 비디오로 새 캘리브레이션:
+  2. 동영상 파일 보정 (→ 동영상으로 출력):
+       python calibrate_undistort.py input.MP4 output.mp4 \\
+           --calib_json calib.json
+
+  3. 체커보드 비디오로 새 캘리브레이션:
        python calibrate_undistort.py <input_dir> <output_dir> \\
            --calib_video data/calib.MP4 \\
            --calib_json calib.json   # 결과 저장 경로 (선택)
 
-  3. 체커보드 이미지 폴더로 새 캘리브레이션:
+  4. 체커보드 이미지 폴더로 새 캘리브레이션:
        python calibrate_undistort.py <input_dir> <output_dir> \\
            --calib_images data/dji_mini_pro_4_calibration/video_frames \\
            --calib_json calib.json   # 결과 저장 경로 (선택)
@@ -37,6 +41,7 @@ log = logging.getLogger(__name__)
 
 # ── 기본 상수 ──────────────────────────────────────────────────────────────────
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"}
+VIDEO_EXTENSIONS = {".mp4", ".MP4", ".mov", ".MOV", ".avi", ".AVI", ".mkv", ".MKV"}
 JPEG_QUALITY = 95
 DEFAULT_BOARD_SIZE = (10, 7)    # 체커보드 내부 코너 수 (cols, rows) — 실제 보드에 맞게 변경
 DEFAULT_SQUARE_SIZE_MM = 25.0  # 체커보드 정사각형 한 변 (mm) — 실제 보드에 맞게 변경
@@ -460,13 +465,110 @@ def undistort_images(
     return {"processed_count": processed_count, "output_dir": output_dir}
 
 
+def undistort_video(
+    input_video: str,
+    output_path: str,
+    params: dict,
+) -> dict:
+    """
+    캘리브레이션 파라미터로 동영상 전체에 왜곡 보정을 적용한다.
+
+    - 입력 동영상과 동일한 FPS, 해상도, 코덱으로 출력
+    - DJI 드론 비디오의 rotation 메타데이터를 감지하여 적용
+
+    Args:
+        input_video: 원본 동영상 파일 경로
+        output_path: 보정 동영상 저장 경로 (파일 경로 또는 디렉토리)
+        params:      캘리브레이션 파라미터 딕셔너리
+
+    Returns:
+        {"processed_frames": int, "output_path": str}
+    """
+    # output_path가 디렉토리면 동일 파일명으로 저장
+    if os.path.isdir(output_path) or not os.path.splitext(output_path)[1]:
+        os.makedirs(output_path, exist_ok=True)
+        out_name = os.path.basename(input_video)
+        output_path = os.path.join(output_path, out_name)
+    else:
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+    rotation = _get_video_rotation(input_video)
+    cap = cv2.VideoCapture(input_video)
+    if not cap.isOpened():
+        raise RuntimeError(f"동영상 열기 실패: {input_video}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    # 첫 프레임으로 해상도 확인 (rotation 적용 후)
+    ret, first_frame = cap.read()
+    if not ret:
+        raise RuntimeError(f"동영상 프레임 읽기 실패: {input_video}")
+    first_frame = _apply_rotation(first_frame, rotation)
+    dst_h, dst_w = first_frame.shape[:2]
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    # 파라미터 스케일링
+    src_w = params.get("image_width", dst_w)
+    src_h = params.get("image_height", dst_h)
+    scaled = _scale_intrinsics(params, src_w, src_h, dst_w, dst_h)
+
+    K = np.array([
+        [scaled["fx"], 0.0,          scaled["cx"]],
+        [0.0,          scaled["fy"], scaled["cy"]],
+        [0.0,          0.0,          1.0         ],
+    ], dtype=np.float64)
+
+    dist_coeffs = np.array([
+        scaled.get("k1", 0.0),
+        scaled.get("k2", 0.0),
+        scaled.get("p1", 0.0),
+        scaled.get("p2", 0.0),
+        scaled.get("k3", 0.0),
+    ], dtype=np.float64)
+
+    # undistort map 사전 계산 (프레임마다 재계산하지 않도록)
+    map1, map2 = cv2.initUndistortRectifyMap(
+        K, dist_coeffs, None, K, (dst_w, dst_h), cv2.CV_16SC2)
+
+    # VideoWriter 설정
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(output_path, fourcc, fps, (dst_w, dst_h))
+    if not writer.isOpened():
+        raise RuntimeError(f"동영상 쓰기 실패: {output_path}")
+
+    log.info(
+        f"동영상 왜곡 보정: {input_video} → {output_path}\n"
+        f"  해상도: {dst_w}x{dst_h}, FPS: {fps:.2f}, "
+        f"총 프레임: {total_frames}, rotation: {rotation}°"
+    )
+
+    processed = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame = _apply_rotation(frame, rotation)
+        undistorted = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
+        writer.write(undistorted)
+        processed += 1
+        if processed % 500 == 0:
+            log.info(f"  진행: {processed}/{total_frames} ({processed/total_frames*100:.0f}%)")
+
+    cap.release()
+    writer.release()
+
+    log.info(f"동영상 보정 완료: {processed}프레임 → {output_path}")
+    return {"processed_frames": processed, "output_path": output_path}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 메인 파이프라인
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_pipeline(
-    input_dir: str,
-    output_dir: str,
+    input_path: str,
+    output_path: str,
     calib_json: str = None,
     calib_video: str = None,
     calib_images: str = None,
@@ -478,16 +580,18 @@ def run_pipeline(
     """
     왜곡 보정 전체 파이프라인.
 
+    입력이 이미지 폴더이면 이미지 일괄 보정, 동영상 파일이면 동영상 보정.
+
     우선순위:
       1. calib_json 파일이 존재하면 → 즉시 로드하여 undistort
       2. calib_json이 없고 calib_video 또는 calib_images가 있으면
          → 체커보드 캘리브레이션 → JSON 저장 → undistort
 
-    캘리브레이션 해상도와 입력 이미지 해상도가 다를 경우 fx/fy/cx/cy를 자동 스케일링.
+    캘리브레이션 해상도와 입력 해상도가 다를 경우 fx/fy/cx/cy를 자동 스케일링.
 
     Args:
-        input_dir:       왜곡 보정할 이미지 폴더
-        output_dir:      보정 이미지 저장 폴더
+        input_path:      왜곡 보정할 이미지 폴더 또는 동영상 파일
+        output_path:     보정 결과 저장 경로 (폴더 또는 동영상 파일)
         calib_json:      기존 캘리브레이션 JSON 경로 (없으면 새로 캘리브레이션 후 저장)
         calib_video:     체커보드 캘리브레이션 비디오 경로 (calib_json 미존재 시 사용)
         calib_images:    체커보드 캘리브레이션 이미지 폴더 (calib_json 미존재 시 사용)
@@ -499,8 +603,6 @@ def run_pipeline(
     Returns:
         {"calibration_params": dict, "undistort_result": dict}
     """
-    os.makedirs(output_dir, exist_ok=True)
-
     # ── 캘리브레이션 파라미터 결정 ────────────────────────────────────────────
     if calib_json and os.path.exists(calib_json):
         log.info(f"[시나리오 1] 기존 캘리브레이션 JSON 사용: {calib_json}")
@@ -514,7 +616,12 @@ def run_pipeline(
 
     elif calib_video or calib_images:
         calib_source = calib_video if calib_video else calib_images
-        save_json = calib_json if calib_json else os.path.join(output_dir, "calibration.json")
+        # output_path가 파일이면 같은 디렉토리에, 폴더면 그 안에 저장
+        if os.path.isfile(input_path):
+            out_dir = os.path.dirname(os.path.abspath(output_path)) if os.path.splitext(output_path)[1] else output_path
+        else:
+            out_dir = output_path
+        save_json = calib_json if calib_json else os.path.join(out_dir, "calibration.json")
 
         log.info(f"[시나리오 2] 체커보드 캘리브레이션 실행: {calib_source}")
         params = calibrate_from_checkerboard(
@@ -533,9 +640,18 @@ def run_pipeline(
             "  --calib_video / --calib_images (체커보드 소스) 중 하나를 지정하세요."
         )
 
-    # ── 왜곡 보정 적용 ────────────────────────────────────────────────────────
-    log.info(f"왜곡 보정 적용: {input_dir} → {output_dir}")
-    result = undistort_images(input_dir, output_dir, params)
+    # ── 왜곡 보정 적용 (이미지 폴더 또는 동영상) ─────────────────────────────
+    is_video = (os.path.isfile(input_path) and
+                os.path.splitext(input_path)[1].lower() in
+                {e.lower() for e in VIDEO_EXTENSIONS})
+
+    if is_video:
+        log.info(f"동영상 왜곡 보정: {input_path} → {output_path}")
+        result = undistort_video(input_path, output_path, params)
+    else:
+        log.info(f"이미지 왜곡 보정: {input_path} → {output_path}")
+        os.makedirs(output_path, exist_ok=True)
+        result = undistort_images(input_path, output_path, params)
 
     return {"calibration_params": params, "undistort_result": result}
 
@@ -550,30 +666,29 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=(
             "드론 카메라 렌즈 왜곡 보정 파이프라인\n"
-            "체커보드 캘리브레이션(또는 기존 JSON) → 왜곡 보정 이미지 일괄 출력"
+            "체커보드 캘리브레이션(또는 기존 JSON) → 왜곡 보정 이미지/동영상 출력"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 사용 예시:
-  # 기존 JSON으로 바로 보정
+  # 이미지 폴더 보정
   python calibrate_undistort.py images/ output/ --calib_json calib.json
+
+  # 동영상 파일 보정 (→ 동영상으로 출력)
+  python calibrate_undistort.py input.MP4 output.mp4 --calib_json calib.json
+
+  # 동영상 파일 보정 (출력 폴더 지정 → 동일 파일명으로 저장)
+  python calibrate_undistort.py input.MP4 output_dir/ --calib_json calib.json
 
   # 체커보드 비디오로 캘리브레이션 후 보정
   python calibrate_undistort.py images/ output/ --calib_video calib.MP4
 
   # 체커보드 이미지 폴더로 캘리브레이션 후 보정
   python calibrate_undistort.py images/ output/ --calib_images calib_frames/
-
-  # 보라매공원 드론 데이터 예시 (동영상 프레임으로 캘리브레이션)
-  python calibrate_undistort.py \\
-      data/Boramae_panorama_drone/2_sfm_output/images/drone \\
-      experiments/drone_undistort/boramae_undistorted \\
-      --calib_images data/dji_mini_pro_4_calibration/video_frames \\
-      --calib_json   data/dji_mini_pro_4_calibration/calibration_video_mode.json
         """,
     )
-    parser.add_argument("input_dir",  help="왜곡 보정할 드론 이미지 폴더")
-    parser.add_argument("output_dir", help="보정 이미지 저장 폴더")
+    parser.add_argument("input_path",  help="왜곡 보정할 이미지 폴더 또는 동영상 파일")
+    parser.add_argument("output_path", help="보정 결과 저장 경로 (폴더 또는 동영상 파일)")
 
     calib_group = parser.add_argument_group("캘리브레이션 소스 (하나 이상 지정)")
     calib_group.add_argument(
@@ -619,8 +734,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     result = run_pipeline(
-        input_dir=args.input_dir,
-        output_dir=args.output_dir,
+        input_path=args.input_path,
+        output_path=args.output_path,
         calib_json=args.calib_json,
         calib_video=args.calib_video,
         calib_images=args.calib_images,
@@ -634,8 +749,12 @@ if __name__ == "__main__":
     undist = result["undistort_result"]
     print(f"\n{'='*60}")
     print(f"[완료] 왜곡 보정 파이프라인 종료")
-    print(f"  보정 이미지 수:   {undist['processed_count']}개")
-    print(f"  출력 폴더:        {undist['output_dir']}")
+    if "processed_count" in undist:
+        print(f"  보정 이미지 수:   {undist['processed_count']}개")
+        print(f"  출력 폴더:        {undist['output_dir']}")
+    elif "processed_frames" in undist:
+        print(f"  보정 프레임 수:   {undist['processed_frames']}개")
+        print(f"  출력 파일:        {undist['output_path']}")
     print(f"  캘리브레이션 RMS: {calib.get('rms', 'N/A')}")
     print(f"  fx={calib['fx']:.2f}, fy={calib['fy']:.2f}, "
           f"cx={calib['cx']:.2f}, cy={calib['cy']:.2f}")

@@ -32,17 +32,26 @@ ffprobe (ffmpeg)
 
 ### 준비물
 - 프린트된 체커보드가 찍힌 사진(20장이상) 혹은 동영상. 
-- 보정되어야할 이미지들
+- 보정되어야할 이미지들 또는 동영상
 
-
-### 시나리오 1: 기존 캘리브레이션 JSON으로 바로 보정
+### 시나리오 1: 이미지 폴더 보정
 
 ```bash
 python calibrate_undistort.py <input_dir> <output_dir> \
     --calib_json calib.json
 ```
 
-### 시나리오 2: 체커보드 비디오로 캘리브레이션 후 보정
+### 시나리오 2: 동영상 파일 보정
+
+```bash
+# 동영상 → 동영상 (파일 경로 지정)
+python calibrate_undistort.py input.MP4 output.mp4 --calib_json calib.json
+
+# 동영상 → 동영상 (출력 폴더 지정 → 동일 파일명으로 저장)
+python calibrate_undistort.py input.MP4 output_dir/ --calib_json calib.json
+```
+
+### 시나리오 3: 체커보드 비디오로 캘리브레이션 후 보정
 
 ```bash
 python calibrate_undistort.py <input_dir> <output_dir> \
@@ -50,7 +59,7 @@ python calibrate_undistort.py <input_dir> <output_dir> \
     --calib_json calib.json      # 결과 저장 경로 (선택)
 ```
 
-### 시나리오 3: 체커보드 이미지 폴더로 캘리브레이션 후 보정
+### 시나리오 4: 체커보드 이미지 폴더로 캘리브레이션 후 보정
 
 ```bash
 python calibrate_undistort.py <input_dir> <output_dir> \
@@ -62,8 +71,8 @@ python calibrate_undistort.py <input_dir> <output_dir> \
 
 | 인자 | 기본값 | 설명 |
 |------|--------|------|
-| `input_dir` | (필수) | 왜곡 보정할 이미지 폴더 |
-| `output_dir` | (필수) | 보정 이미지 저장 폴더 |
+| `input_path` | (필수) | 왜곡 보정할 이미지 폴더 또는 동영상 파일 |
+| `output_path` | (필수) | 보정 결과 저장 경로 (폴더 또는 동영상 파일) |
 | `--calib_json` | None | 기존 캘리브레이션 JSON 경로 (있으면 즉시 사용, 없으면 캘리브레이션 후 저장) |
 | `--calib_video` | None | 체커보드 캘리브레이션 비디오 파일 |
 | `--calib_images` | None | 체커보드 캘리브레이션 이미지 폴더 |
